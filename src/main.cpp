@@ -34,8 +34,21 @@ static inline u64 tailw(const char* p, size_t m) {
     if (m >= 4) return rd4(p) | (rd4(p + m - 4) << 32);
     return (u64)(unsigned char)p[0] | ((u64)(unsigned char)p[m >> 1] << 8) | ((u64)(unsigned char)p[m - 1] << 16);
 }
+// Short keys (<= 16 bytes: every id in the data) are loaded as two overlapping words, so every byte lands in a or b,
+// and mixed with two multiplies; longer keys keep the word loop.
+static inline void ld16(const char* p, size_t n, u64& a, u64& b) {
+    if (n >= 8) { a = rd8(p); b = rd8(p + n - 8); }
+    else if (n >= 4) { a = rd4(p) | (rd4(p + n - 4) << 32); b = 0; }
+    else if (n) { a = tailw(p, n); b = 0; }
+    else { a = 0; b = 0; }
+}
+static inline u64 hash16(u64 a, u64 b, size_t n, u64 seed) {
+    const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
+    return wmix(wmix(a ^ K1, b ^ seed ^ ((u64)n * K2)) ^ K0, K1);
+}
 static inline u64 hashstr(const char* p, size_t n, u64 seed) {
     const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
+    if (n <= 16) { u64 a, b; ld16(p, n, a, b); return hash16(a, b, n, seed); }
     u64 h = seed ^ ((u64)n * K2);
     while (n >= 8) { h = wmix(h ^ rd8(p), K1); p += 8; n -= 8; }
     if (n) h = wmix(h ^ tailw(p, n) ^ K2, K0);
@@ -345,13 +358,18 @@ static inline void handle_event(Worker& w, const char* ls, const char* le) {
     if (!splitline(ls, le, 7, f)) return;
     if (f[0].n == 0) return;
     EvRec r;
-    { // both dedup hashes in one pass over the id bytes
+    { // both dedup hashes from one load of the id bytes
         const char* q = f[0].p; size_t m = f[0].n;
-        const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
-        u64 ha = SEED_E1 ^ ((u64)m * K2), hb = SEED_E2 ^ ((u64)m * K2);
-        while (m >= 8) { u64 w8 = rd8(q); ha = wmix(ha ^ w8, K1); hb = wmix(hb ^ w8, K0); q += 8; m -= 8; }
-        if (m) { u64 w8 = tailw(q, m); ha = wmix(ha ^ w8 ^ K2, K0); hb = wmix(hb ^ w8 ^ K1, K2); }
-        r.h1 = wmix(ha ^ K0, K1); r.h2 = (u32)(wmix(hb ^ K2, K0) >> 32);
+        if (m <= 16) {
+            u64 a, b; ld16(q, m, a, b);
+            r.h1 = hash16(a, b, m, SEED_E1); r.h2 = (u32)(hash16(a, b, m, SEED_E2) >> 32);
+        } else {
+            const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
+            u64 ha = SEED_E1 ^ ((u64)m * K2), hb = SEED_E2 ^ ((u64)m * K2);
+            while (m >= 8) { u64 w8 = rd8(q); ha = wmix(ha ^ w8, K1); hb = wmix(hb ^ w8, K0); q += 8; m -= 8; }
+            if (m) { u64 w8 = tailw(q, m); ha = wmix(ha ^ w8 ^ K2, K0); hb = wmix(hb ^ w8 ^ K1, K2); }
+            r.h1 = wmix(ha ^ K0, K1); r.h2 = (u32)(wmix(hb ^ K2, K0) >> 32);
+        }
     }
     i64 ing; bool ingbad = !parse_ts(f[3].p, f[3].n, ing);
     if (ingbad) ing = INT64_MAX;
