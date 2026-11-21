@@ -90,6 +90,27 @@ static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
     return era * 146097 + (i64)doe - 719468;
 }
 static bool parse_ts(const char* p, size_t n, i64& out) {
+    if (n == 20) {   // F1 fast path: branch-free validation; anything unusual falls through to the full checks below
+        unsigned bad = (p[4] != '-') | (p[7] != '-') | (p[10] != 'T') | (p[13] != ':') | (p[16] != ':') | (p[19] != 'Z');
+        static const int dp[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+        for (int i = 0; i < 14; i++) bad |= (unsigned)((unsigned char)(p[dp[i]] - '0') > 9);
+        if (!bad) {
+            int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
+            static const unsigned char dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            if (mo >= 1 && mo <= 12 && d >= 1 && h <= 23 && mi <= 59 && s <= 59) {
+                int dim = dm[mo - 1];
+                if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
+                if (d <= dim) {
+                    out = days_from_civil(y, (unsigned)mo, (unsigned)d) * DAYMS + (i64)((h * 60 + mi) * 60 + s) * 1000LL;
+                    return true;
+                }
+            }
+        }
+    } else if (n >= 1 && n <= 18) {   // F3 fast path: all ASCII digits (leading zeros are harmless in <= 18 digits)
+        unsigned bad = 0; u64 v = 0;
+        for (size_t i = 0; i < n; i++) { unsigned dgt = (unsigned)(unsigned char)(p[i] - '0'); bad |= (dgt > 9); v = v * 10 + dgt; }
+        if (!bad) { out = (i64)v; return true; }
+    }
     if ((n == 20 || n == 25) && p[4] == '-') {
         static const int pos[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
         for (int i : pos) if (!isd(p[i])) return false;
@@ -246,8 +267,14 @@ static inline void handle_event(Worker& w, const char* ls, const char* le) {
     if (!splitline(ls, le, 7, f)) return;
     if (f[0].n == 0) return;
     EvRec r;
-    r.h1 = hashstr(f[0].p, f[0].n, SEED_E1);
-    r.h2 = (u32)(hashstr(f[0].p, f[0].n, SEED_E2) >> 32);
+    { // both dedup hashes in one pass over the id bytes
+        const char* q = f[0].p; size_t m = f[0].n;
+        const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
+        u64 ha = SEED_E1 ^ ((u64)m * K2), hb = SEED_E2 ^ ((u64)m * K2);
+        while (m >= 8) { u64 w8 = rd8(q); ha = wmix(ha ^ w8, K1); hb = wmix(hb ^ w8, K0); q += 8; m -= 8; }
+        if (m) { u64 w8 = 0; memcpy(&w8, q, m); ha = wmix(ha ^ w8 ^ K2, K0); hb = wmix(hb ^ w8 ^ K1, K2); }
+        r.h1 = wmix(ha ^ K0, K1); r.h2 = (u32)(wmix(hb ^ K2, K0) >> 32);
+    }
     i64 ing; bool ingbad = !parse_ts(f[3].p, f[3].n, ing);
     if (ingbad) ing = INT64_MAX;
     r.ingest = ing; r.ok = 0; r.uh = 0; r.nm = 0; r.ts = 0; r.price = 0; r.cat = 0; r.type = 0;
@@ -541,7 +568,9 @@ int main(int argc, char** argv) {
             size_t cap = 16; while (cap < 2 * n) cap <<= 1;
             w.tab.assign(cap, Worker::DS{0, 0, 0}); w.cand.clear(); w.cand.reserve(n);
             size_t mask = cap - 1;
-            for (int t = 0; t < NT; t++) for (const EvRec& r : W[t].evb[d]) {
+            for (int t = 0; t < NT; t++) { const std::vector<EvRec>& vb = W[t].evb[d]; const size_t vn = vb.size(); for (size_t vi = 0; vi < vn; vi++) {
+                const EvRec& r = vb[vi];
+                if (vi + 8 < vn) __builtin_prefetch(&w.tab[vb[vi + 8].h1 & mask]);
                 size_t pos = r.h1 & mask;
                 for (;;) {
                     Worker::DS& s = w.tab[pos];
@@ -549,8 +578,10 @@ int main(int argc, char** argv) {
                     if (s.h1 == r.h1 && s.h2 == r.h2) { const EvRec*& c = w.cand[s.ref - 1]; if (r.ingest < c->ingest) c = &r; break; }
                     pos = (pos + 1) & mask;
                 }
-            }
-            for (const EvRec* c : w.cand) if (c->ok) {
+            } }
+            const size_t cn2 = w.cand.size();
+            for (size_t ci2 = 0; ci2 < cn2; ci2++) { const EvRec* c = w.cand[ci2]; if (!c->ok) continue;
+                if (ci2 + 8 < cn2 && !linkT.s.empty()) __builtin_prefetch(&linkT.s[w.cand[ci2 + 8]->uh & linkT.mask]);
                 u64 pkey, nm; resolve(c->uh, c->nm, pkey, nm);
                 w.evp[pkey >> (64 - PB)].push_back(SvRec{pkey, nm, c->ts, c->price, c->cat, c->type, 0});
             }
