@@ -50,15 +50,18 @@ struct Str { const char* p; u32 n; };
 // Shared validation of quoted fields: valid iff every quote belongs to a field wrapped in exactly one pair of quotes
 // (a wrapped field holds >= 2 quotes, so total == 2 * #wrapped forces exactly 2 each and 0 elsewhere).
 static inline bool unquote_fields(int nf, Str* out, unsigned qc) {
-    // Branch-free (quote placement is random, so branches would mispredict). Reads p[-1] instead of p[0] for empty
-    // fields: p[-1] always exists (the header, a comma, or the previous line's newline); p[n] might not.
+    // Branch-free for all but the last field (quote placement is random, so branches would mispredict). Every field but
+    // the last is followed by a comma, so f.p[0] is readable even when empty; f.p[-1] always exists (header, comma or
+    // the previous line's newline), so f.p[n-1] is safe for n == 0 as well.
     unsigned wrapped = 0;
-    for (int i = 0; i < nf; i++) {
+    for (int i = 0; i < nf - 1; i++) {
         Str& f = out[i];
-        const unsigned first = (unsigned char)f.p[-(ptrdiff_t)(f.n == 0)];
-        const unsigned last = (unsigned char)f.p[(ptrdiff_t)f.n - 1];
-        const unsigned w = (unsigned)(f.n >= 2) & (unsigned)(first == '"') & (unsigned)(last == '"');
+        const unsigned w = (unsigned)(f.n >= 2) & (unsigned)(f.p[0] == '"') & (unsigned)(f.p[(ptrdiff_t)f.n - 1] == '"');
         f.p += w; f.n -= 2 * w; wrapped += w;
+    }
+    {
+        Str& f = out[nf - 1];
+        if (f.n >= 2 && f.p[0] == '"' && f.p[f.n - 1] == '"') { f.p++; f.n -= 2; ++wrapped; }
     }
     return qc == 2 * wrapped;
 }
@@ -678,7 +681,12 @@ int main(int argc, char** argv) {
         w.st_sess.assign(NS, 0); w.st_purch.assign(NS, 0); w.st_assist.assign(NS, 0); w.st_rev.assign(NS, 0);
         w.cnt.assign(NC + 1, 0); w.apos.assign(NC + 1, 0); w.catrev.assign(catNames.size(), 0);
     }
-    run_parallel(NT, (size_t)P, [&](int tid, size_t p) {
+    std::vector<u32> order(P);
+    { std::vector<size_t> psz(P, 0);
+      for (int p = 0; p < P; p++) { order[p] = (u32)p; for (int t = 0; t < NT; t++) psz[p] += W[t].evp[p].size() + W[t].clp[p].size(); }
+      std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return psz[a] != psz[b] ? psz[a] > psz[b] : a < b; }); }
+    run_parallel(NT, (size_t)P, [&](int tid, size_t pi) {
+        const size_t p = order[pi];
         Worker& w = W[tid];
         std::vector<SvRec>& ev = w.ev; std::vector<ClRec>& cl = w.cl; ev.clear(); cl.clear();
         size_t n = 0;
@@ -819,5 +827,6 @@ int main(int argc, char** argv) {
         pf.close();
     }
     phase("written");
-    return 0;
+    fflush(NULL);
+    _exit(0);   // all output files are closed; skip tearing down gigabytes of containers one allocation at a time
 }
