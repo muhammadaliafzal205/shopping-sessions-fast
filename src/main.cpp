@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <emmintrin.h>
+#include <set>
 
 typedef uint64_t u64; typedef int64_t i64; typedef uint32_t u32; typedef uint16_t u16; typedef uint8_t u8;
 static const i64 DAYMS = 86400000LL, GAPMS = 1800000LL, WEEKMS = 604800000LL;
@@ -49,10 +50,15 @@ struct Str { const char* p; u32 n; };
 // Shared validation of quoted fields: valid iff every quote belongs to a field wrapped in exactly one pair of quotes
 // (a wrapped field holds >= 2 quotes, so total == 2 * #wrapped forces exactly 2 each and 0 elsewhere).
 static inline bool unquote_fields(int nf, Str* out, unsigned qc) {
+    // Branch-free (quote placement is random, so branches would mispredict). Reads p[-1] instead of p[0] for empty
+    // fields: p[-1] always exists (the header, a comma, or the previous line's newline); p[n] might not.
     unsigned wrapped = 0;
     for (int i = 0; i < nf; i++) {
         Str& f = out[i];
-        if (f.n >= 2 && f.p[0] == '"' && f.p[f.n - 1] == '"') { f.p++; f.n -= 2; ++wrapped; }
+        const unsigned first = (unsigned char)f.p[-(ptrdiff_t)(f.n == 0)];
+        const unsigned last = (unsigned char)f.p[(ptrdiff_t)f.n - 1];
+        const unsigned w = (unsigned)(f.n >= 2) & (unsigned)(first == '"') & (unsigned)(last == '"');
+        f.p += w; f.n -= 2 * w; wrapped += w;
     }
     return qc == 2 * wrapped;
 }
@@ -160,16 +166,36 @@ static inline bool civil_days(int y, int mo, int d, i64& days) {
     e.key = key; e.days = days;
     return true;
 }
+struct DateEnt { u64 a, b; i64 days; };
+static thread_local DateEnt g_de[256];
+// "YYYY-MM-DD" at p[0..9] -> days since epoch; false if malformed or not a real date. Cached on the raw 10 bytes:
+// a data set spans only a few dozen dates, so almost every call is one hash and one compare.
+static inline bool date_days(const char* p, i64& days) {
+    const u64 a = ld8(p), b = (u64)(unsigned char)p[8] | ((u64)(unsigned char)p[9] << 8) | (1ULL << 16);   // bit 16: non-empty
+    DateEnt& e = g_de[((a ^ (b * 0x9E3779B97F4A7C15ULL)) * 0xff51afd7ed558ccdULL) >> 56];
+    if (e.a == a && e.b == b) { days = e.days; return true; }
+    if (p[4] != '-' || p[7] != '-') return false;
+    static const int dp[] = {0, 1, 2, 3, 5, 6, 8, 9};
+    for (int i : dp) if (!isd(p[i])) return false;
+    if (!civil_days(d2(p) * 100 + d2(p + 2), d2(p + 5), d2(p + 8), days)) return false;
+    e.a = a; e.b = b; e.days = days;
+    return true;
+}
+// "HH:MM:SS" at p[0..7] -> hour, minute, second; false if malformed or out of range
+static inline bool time_hms(const char* p, int& h, int& mi, int& s) {
+    const u64 t = ld8(p), Z = 0x3030303030303030ULL, S = (0xFFULL << 16) | (0xFFULL << 40), E = ((u64)':' << 16) | ((u64)':' << 40);
+    if ((t & S) != E || !dig8((t & ~S) | (Z & S))) return false;
+    h = d2(p); mi = d2(p + 3); s = d2(p + 6);
+    return h <= 23 && mi <= 59 && s <= 59;
+}
 static bool parse_ts(const char* p, size_t n, i64& out) {
     if (n == 13) {   // epoch milliseconds, the common numeric form
         const u64 a = ld8(p), b = ld8(p + 5);
         if (dig8(a) && dig8(b)) { out = (i64)(parse8(a << 24) * 100000000ULL + parse8(b)); return true; }
     } else if ((n == 20 || n == 25) && p[4] == '-') {
-        if (!dt_shape(p)) return false;
-        const int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
-        if (h > 23 || mi > 59 || s > 59) return false;
-        i64 days;
-        if (!civil_days(y, mo, d, days)) return false;
+        if (p[10] != 'T') return false;
+        i64 days; int h, mi, s;
+        if (!date_days(p, days) || !time_hms(p + 11, h, mi, s)) return false;
         i64 off = 0;
         if (n == 20) { if (p[19] != 'Z') return false; }
         else {
@@ -540,8 +566,7 @@ int main(int argc, char** argv) {
         if (m.d) for_lines(m.d, m.n, 0, m.n, [&](const char* ls, const char* le) {
             Str f[2]; if (!splitline(ls, le, 2, f) || f[0].n == 0) return;
             std::string c(f[1].p, f[1].n); pr.push_back({hid(f[0].p, f[0].n), c}); });
-        std::vector<std::string> names; for (auto& x : pr) names.push_back(x.second);
-        std::sort(names.begin(), names.end()); names.erase(std::unique(names.begin(), names.end()), names.end());
+        std::vector<std::string> names; { std::set<std::string> uniq; for (auto& x : pr) uniq.insert(x.second); names.assign(uniq.begin(), uniq.end()); }
         catNames = names;
         std::string unk = "unknown"; while (std::binary_search(names.begin(), names.end(), unk)) unk += "_";
         catNames.push_back(unk); UNKCAT = (int)catNames.size() - 1;
@@ -656,25 +681,25 @@ int main(int argc, char** argv) {
     run_parallel(NT, (size_t)P, [&](int tid, size_t p) {
         Worker& w = W[tid];
         std::vector<SvRec>& ev = w.ev; std::vector<ClRec>& cl = w.cl; ev.clear(); cl.clear();
+        size_t n = 0;
         for (int t = 0; t < NT; t++) {
-            auto& a = W[t].evp[p]; ev.insert(ev.end(), a.begin(), a.end()); std::vector<SvRec>().swap(a);
+            n += W[t].evp[p].size();
             auto& c = W[t].clp[p]; cl.insert(cl.end(), c.begin(), c.end()); std::vector<ClRec>().swap(c);
         }
-        if (ev.empty()) return;
+        if (n == 0) return;
         {
-            // Bucket by the pkey bits just below the partition bits (counting sort, one scatter pass), then sort each
-            // small bucket by (pkey, ts). A person's events share a pkey, so they land in one bucket; ~30 elements per
-            // std::sort instead of ~10^4 per partition. Same final order as one global (pkey, ts) sort.
-            const size_t n = ev.size();
+            // Bucket by the pkey bits just below the partition bits (counting sort), reading straight from the per-thread
+            // lists (merge and scatter in one pass), then sort each small bucket by (pkey, ts). A person's events share a
+            // pkey, so they land in one bucket: ~30 elements per std::sort instead of ~10^4 per partition.
             int bits = 4; while (bits < 16 && ((size_t)1 << (bits + 3)) < n) bits++;
             const size_t nb = (size_t)1 << bits;
             const int sh = 64 - PB - bits;
             w.hist.assign(nb + 1, 0);
-            for (size_t x = 0; x < n; x++) w.hist[((ev[x].pkey >> sh) & (nb - 1)) + 1]++;
+            for (int t = 0; t < NT; t++) for (const SvRec& r : W[t].evp[p]) w.hist[((r.pkey >> sh) & (nb - 1)) + 1]++;
             for (size_t b = 0; b < nb; b++) w.hist[b + 1] += w.hist[b];
             w.ev2.resize(n);
             { std::vector<u32>& pos = w.apos2; pos.assign(w.hist.begin(), w.hist.end() - 1);
-              for (size_t x = 0; x < n; x++) w.ev2[pos[(ev[x].pkey >> sh) & (nb - 1)]++] = ev[x]; }
+              for (int t = 0; t < NT; t++) { auto& a = W[t].evp[p]; for (const SvRec& r : a) w.ev2[pos[(r.pkey >> sh) & (nb - 1)]++] = r; std::vector<SvRec>().swap(a); } }
             ev.swap(w.ev2);
             auto cmp = [](const SvRec& a, const SvRec& b) { return a.pkey != b.pkey ? a.pkey < b.pkey : a.ts < b.ts; };
             for (size_t b = 0; b < nb; b++) {
