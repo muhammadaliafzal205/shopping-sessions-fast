@@ -7,4 +7,5 @@ RUN g++ -O3 -std=c++17 -pthread -static -o /pipeline src/main.cpp
 FROM debian:bookworm-slim
 COPY --from=build /pipeline /app/pipeline
 WORKDIR /app
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 CMD ["/app/pipeline"]
