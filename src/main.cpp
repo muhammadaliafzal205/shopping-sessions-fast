@@ -27,11 +27,17 @@ static inline size_t plen(u64 v) { return (size_t)(v >> 48); }
 static inline i64 fdiv(i64 a, i64 b) { i64 q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
 static inline u64 rd8(const char* p) { u64 v; memcpy(&v, p, 8); return v; }
 static inline u64 wmix(u64 a, u64 b) { __uint128_t r = (__uint128_t)a * b; return (u64)r ^ (u64)(r >> 64); }
+// Pack a 1..7-byte tail into one word without a library call; every byte of the tail lands in the word.
+static inline u64 rd4(const char* p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static inline u64 tailw(const char* p, size_t m) {
+    if (m >= 4) return rd4(p) | (rd4(p + m - 4) << 32);
+    return (u64)(unsigned char)p[0] | ((u64)(unsigned char)p[m >> 1] << 8) | ((u64)(unsigned char)p[m - 1] << 16);
+}
 static inline u64 hashstr(const char* p, size_t n, u64 seed) {
     const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
     u64 h = seed ^ ((u64)n * K2);
     while (n >= 8) { h = wmix(h ^ rd8(p), K1); p += 8; n -= 8; }
-    if (n) { u64 w = 0; memcpy(&w, p, n); h = wmix(h ^ w ^ K2, K0); }
+    if (n) h = wmix(h ^ tailw(p, n) ^ K2, K0);
     return wmix(h ^ K0, K1);
 }
 static const u64 SEED_ID = 0x243F6A8885A308D3ULL, SEED_E1 = 0x13198A2E03707344ULL, SEED_E2 = 0xA4093822299F31D0ULL;
@@ -40,23 +46,20 @@ static inline u64 hid(const char* p, size_t n) { return hashstr(p, n, SEED_ID); 
 struct Str { const char* p; u32 n; };
 
 // Split a line into exactly nf fields following the CSV dialect; false = malformed.
-// SSE2 fast path: 16 bytes at a time, comma/quote bitmasks; scalar tail (never reads past e).
-static inline bool splitline(const char* s, const char* e, int nf, Str* out) {
-    int k = 0; const char* fs = s; unsigned qc = 0;
-    const char* p = s;
-    const __m128i vc = _mm_set1_epi8(','), vq = _mm_set1_epi8('"');
-    for (; p + 16 <= e; p += 16) {
-        __m128i x = _mm_loadu_si128((const __m128i*)p);
-        unsigned mc = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, vc));
-        qc += (unsigned)__builtin_popcount((unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, vq)));
-        while (mc) {
-            int b = __builtin_ctz(mc); mc &= mc - 1;
-            const char* c = p + b;
-            if (k >= nf - 1) return false;
-            out[k].p = fs; out[k].n = (u32)(c - fs); ++k; fs = c + 1;
-        }
+// Shared validation of quoted fields: valid iff every quote belongs to a field wrapped in exactly one pair of quotes
+// (a wrapped field holds >= 2 quotes, so total == 2 * #wrapped forces exactly 2 each and 0 elsewhere).
+static inline bool unquote_fields(int nf, Str* out, unsigned qc) {
+    unsigned wrapped = 0;
+    for (int i = 0; i < nf; i++) {
+        Str& f = out[i];
+        if (f.n >= 2 && f.p[0] == '"' && f.p[f.n - 1] == '"') { f.p++; f.n -= 2; ++wrapped; }
     }
-    for (; p < e; ++p) {
+    return qc == 2 * wrapped;
+}
+// Scalar version: used for very short or very long lines.
+static bool splitline_slow(const char* s, const char* e, int nf, Str* out) {
+    int k = 0; const char* fs = s; unsigned qc = 0;
+    for (const char* p = s; p < e; ++p) {
         char c = *p;
         if (c == ',') {
             if (k >= nf - 1) return false;
@@ -65,17 +68,48 @@ static inline bool splitline(const char* s, const char* e, int nf, Str* out) {
     }
     if (k != nf - 1) return false;
     out[k].p = fs; out[k].n = (u32)(e - fs);
-    if (qc) {
-        // valid iff every quote belongs to a field that is wrapped in exactly one pair of quotes:
-        // a wrapped field holds >= 2 quotes, so total == 2 * (#wrapped) forces exactly 2 each and 0 elsewhere.
-        unsigned wrapped = 0;
-        for (int i = 0; i < nf; i++) {
-            Str& f = out[i];
-            if (f.n >= 2 && f.p[0] == '"' && f.p[f.n - 1] == '"') { f.p++; f.n -= 2; ++wrapped; }
+    return qc == 0 || unquote_fields(nf, out, qc);
+}
+// SSE2: 16 bytes per step; quote counting via byte-lane accumulation (no popcount instruction needed); the last partial
+// block is one overlapping load ending exactly at e, with the already-seen bytes masked out. Never reads outside [s,e).
+static const unsigned char kLaneMask[32] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255};
+static inline bool splitline(const char* s, const char* e, int nf, Str* out) {
+    const size_t len = (size_t)(e - s);
+    if (len < 16 || len > 4000) return splitline_slow(s, e, nf, out);   // lanes hold <= 251 blocks: no byte overflow
+    int k = 0; const char* fs = s;
+    const __m128i vc = _mm_set1_epi8(','), vq = _mm_set1_epi8('"');
+    __m128i qacc = _mm_setzero_si128();
+    const char* p = s;
+    for (; p + 16 <= e; p += 16) {
+        __m128i x = _mm_loadu_si128((const __m128i*)p);
+        unsigned mc = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, vc));
+        qacc = _mm_sub_epi8(qacc, _mm_cmpeq_epi8(x, vq));
+        while (mc) {
+            int b = __builtin_ctz(mc); mc &= mc - 1;
+            const char* c = p + b;
+            if (k >= nf - 1) return false;
+            out[k].p = fs; out[k].n = (u32)(c - fs); ++k; fs = c + 1;
         }
-        if (qc != 2 * wrapped) return false;
     }
-    return true;
+    const size_t rem = (size_t)(e - p);
+    if (rem) {
+        const char* q = e - 16;   // len >= 16, so q >= s
+        __m128i x = _mm_loadu_si128((const __m128i*)q);
+        __m128i lm = _mm_loadu_si128((const __m128i*)(kLaneMask + rem));   // zeros for the (16-rem) bytes already seen
+        unsigned mc = (unsigned)_mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(x, vc), lm));
+        qacc = _mm_sub_epi8(qacc, _mm_and_si128(_mm_cmpeq_epi8(x, vq), lm));
+        while (mc) {
+            int b = __builtin_ctz(mc); mc &= mc - 1;
+            const char* c = q + b;
+            if (k >= nf - 1) return false;
+            out[k].p = fs; out[k].n = (u32)(c - fs); ++k; fs = c + 1;
+        }
+    }
+    if (k != nf - 1) return false;
+    out[k].p = fs; out[k].n = (u32)(e - fs);
+    __m128i sad = _mm_sad_epu8(qacc, _mm_setzero_si128());
+    unsigned qc = (unsigned)_mm_cvtsi128_si32(sad) + (unsigned)_mm_extract_epi16(sad, 4);
+    return qc == 0 || unquote_fields(nf, out, qc);
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -89,38 +123,53 @@ static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
     unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     return era * 146097 + (i64)doe - 719468;
 }
+static inline u64 ld8(const char* p) { u64 v; memcpy(&v, p, 8); return v; }
+// all 8 bytes are ASCII digits
+static inline bool dig8(u64 x) {
+    u64 t = x ^ 0x3030303030303030ULL;
+    return ((((t & 0x7F7F7F7F7F7F7F7FULL) + 0x7676767676767676ULL) | t) & 0x8080808080808080ULL) == 0;
+}
+static inline u64 parse8(u64 v) {   // 8 ASCII digits (first char in the lowest byte) -> number
+    v = (v & 0x0F0F0F0F0F0F0F0FULL) * 2561 >> 8;
+    v = (v & 0x00FF00FF00FF00FFULL) * 6553601 >> 16;
+    return (v & 0x0000FFFF0000FFFFULL) * 42949672960001ULL >> 32;
+}
+// shape check of "YYYY-MM-DDTHH:MM:SS" at p[0..18] (p must have >= 20 readable bytes): separators exact, others digits
+static inline bool dt_shape(const char* p) {
+    const u64 a = ld8(p), b = ld8(p + 8), c = ld8(p + 12), Z = 0x3030303030303030ULL;
+    const u64 SA = (0xFFULL << 32) | (0xFFULL << 56), EA = ((u64)'-' << 32) | ((u64)'-' << 56);   // p[4] p[7]
+    const u64 SB = (0xFFULL << 16) | (0xFFULL << 40), EB = ((u64)'T' << 16) | ((u64)':' << 40);   // p[10] p[13]
+    const u64 SC = (0xFFULL << 8) | (0xFFULL << 32), EC = ((u64)':' << 8) | ((u64)':' << 32);     // p[13] p[16]
+    const u64 SC7 = SC | (0xFFULL << 56);                                                          // plus p[19]
+    if (((a & SA) != EA) | ((b & SB) != EB) | ((c & SC) != EC)) return false;
+    return dig8((a & ~SA) | (Z & SA)) & dig8((b & ~SB) | (Z & SB)) & dig8((c & ~SC7) | (Z & SC7));
+}
+struct DayCache { u32 key; i64 days; };
+static thread_local DayCache g_dc[256];
+// days since epoch for a calendar date; false if the date does not exist. Cached: a data set spans only a few dozen days.
+static inline bool civil_days(int y, int mo, int d, i64& days) {
+    const u32 key = (u32)y * 10000u + (u32)mo * 100u + (u32)d + 1u;   // +1: 0 means empty
+    DayCache& e = g_dc[(key * 2654435761u) >> 24];
+    if (e.key == key) { days = e.days; return true; }
+    if (mo < 1 || mo > 12 || d < 1) return false;
+    static const unsigned char dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int dim = dm[mo - 1];
+    if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
+    if (d > dim) return false;
+    days = days_from_civil(y, (unsigned)mo, (unsigned)d);
+    e.key = key; e.days = days;
+    return true;
+}
 static bool parse_ts(const char* p, size_t n, i64& out) {
-    if (n == 20) {   // F1 fast path: branch-free validation; anything unusual falls through to the full checks below
-        unsigned bad = (p[4] != '-') | (p[7] != '-') | (p[10] != 'T') | (p[13] != ':') | (p[16] != ':') | (p[19] != 'Z');
-        static const int dp[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
-        for (int i = 0; i < 14; i++) bad |= (unsigned)((unsigned char)(p[dp[i]] - '0') > 9);
-        if (!bad) {
-            int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
-            static const unsigned char dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-            if (mo >= 1 && mo <= 12 && d >= 1 && h <= 23 && mi <= 59 && s <= 59) {
-                int dim = dm[mo - 1];
-                if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
-                if (d <= dim) {
-                    out = days_from_civil(y, (unsigned)mo, (unsigned)d) * DAYMS + (i64)((h * 60 + mi) * 60 + s) * 1000LL;
-                    return true;
-                }
-            }
-        }
-    } else if (n >= 1 && n <= 18) {   // F3 fast path: all ASCII digits (leading zeros are harmless in <= 18 digits)
-        unsigned bad = 0; u64 v = 0;
-        for (size_t i = 0; i < n; i++) { unsigned dgt = (unsigned)(unsigned char)(p[i] - '0'); bad |= (dgt > 9); v = v * 10 + dgt; }
-        if (!bad) { out = (i64)v; return true; }
-    }
-    if ((n == 20 || n == 25) && p[4] == '-') {
-        static const int pos[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
-        for (int i : pos) if (!isd(p[i])) return false;
-        if (p[7] != '-' || p[10] != 'T' || p[13] != ':' || p[16] != ':') return false;
-        int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
-        if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || s > 59) return false;
-        static const int dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-        int dim = dm[mo - 1];
-        if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) dim = 29;
-        if (d > dim) return false;
+    if (n == 13) {   // epoch milliseconds, the common numeric form
+        const u64 a = ld8(p), b = ld8(p + 5);
+        if (dig8(a) && dig8(b)) { out = (i64)(parse8(a << 24) * 100000000ULL + parse8(b)); return true; }
+    } else if ((n == 20 || n == 25) && p[4] == '-') {
+        if (!dt_shape(p)) return false;
+        const int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), s = d2(p + 17);
+        if (h > 23 || mi > 59 || s > 59) return false;
+        i64 days;
+        if (!civil_days(y, mo, d, days)) return false;
         i64 off = 0;
         if (n == 20) { if (p[19] != 'Z') return false; }
         else {
@@ -131,7 +180,7 @@ static bool parse_ts(const char* p, size_t n, i64& out) {
             if (oh > 23 || om > 59) return false;
             off = (i64)(oh * 60 + om) * 60000LL; if (sg == '-') off = -off;
         }
-        out = days_from_civil(y, (unsigned)mo, (unsigned)d) * DAYMS + (i64)((h * 60 + mi) * 60 + s) * 1000LL - off;
+        out = days * DAYMS + (i64)((h * 60 + mi) * 60 + s) * 1000LL - off;
         return true;
     }
     if (n == 0) return false;
@@ -272,7 +321,7 @@ static inline void handle_event(Worker& w, const char* ls, const char* le) {
         const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL, K2 = 0x8ebc6af09c88c6e3ULL;
         u64 ha = SEED_E1 ^ ((u64)m * K2), hb = SEED_E2 ^ ((u64)m * K2);
         while (m >= 8) { u64 w8 = rd8(q); ha = wmix(ha ^ w8, K1); hb = wmix(hb ^ w8, K0); q += 8; m -= 8; }
-        if (m) { u64 w8 = 0; memcpy(&w8, q, m); ha = wmix(ha ^ w8 ^ K2, K0); hb = wmix(hb ^ w8 ^ K1, K2); }
+        if (m) { u64 w8 = tailw(q, m); ha = wmix(ha ^ w8 ^ K2, K0); hb = wmix(hb ^ w8 ^ K1, K2); }
         r.h1 = wmix(ha ^ K0, K1); r.h2 = (u32)(wmix(hb ^ K2, K0) >> 32);
     }
     i64 ing; bool ingbad = !parse_ts(f[3].p, f[3].n, ing);
