@@ -1,0 +1,5 @@
+.git
+pipeline
+dev
+out
+*.parquet
